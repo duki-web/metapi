@@ -564,28 +564,6 @@ function resolveShortWindowLimitCooldown(
   return new Date(nowMs + SHORT_WINDOW_LIMIT_COOLDOWN_MS).toISOString();
 }
 
-async function loadCredentialScopedChannelIds(
-  channel: typeof schema.routeChannels.$inferSelect,
-  accountId: number,
-): Promise<number[]> {
-  if (typeof channel.tokenId === 'number' && channel.tokenId > 0) {
-    const rows = await db.select({ id: schema.routeChannels.id })
-      .from(schema.routeChannels)
-      .where(eq(schema.routeChannels.tokenId, channel.tokenId))
-      .all();
-    return rows.map((row) => row.id);
-  }
-
-  const rows = await db.select({ id: schema.routeChannels.id })
-    .from(schema.routeChannels)
-    .where(and(
-      eq(schema.routeChannels.accountId, accountId),
-      isNull(schema.routeChannels.tokenId),
-    ))
-    .all();
-  return rows.map((row) => row.id);
-}
-
 function getDecayedSiteRuntimePenalty(state: SiteRuntimeHealthState, nowMs: number): number {
   if (!Number.isFinite(state.penaltyScore) || state.penaltyScore <= 0) return 0;
   const elapsedMs = Math.max(0, nowMs - state.lastUpdatedAtMs);
@@ -1380,8 +1358,12 @@ function hasCustomDisplayName(route: Pick<RouteRow, 'modelPattern' | 'displayNam
 function buildVisibleEnabledRoutes(routes: RouteRow[]): RouteRow[] {
   const exactModelNames = new Set(
     routes
-      .filter((route) => !isExplicitGroupRoute(route) && isExactRouteModelPattern(route.modelPattern))
-      .map((route) => (route.modelPattern || '').trim())
+      .filter((route) => (
+        !isExplicitGroupRoute(route)
+        && isExactRouteModelPattern(route.modelPattern)
+        && !!normalizeRouteDisplayName(route.displayName)
+      ))
+      .map((route) => (route.modelPattern || '').trim().toLowerCase())
       .filter(Boolean),
   );
   const coveringGroups = routes.filter((route) => (
@@ -1407,7 +1389,17 @@ function buildVisibleEnabledRoutes(routes: RouteRow[]): RouteRow[] {
     return !coveringGroups.some((groupRoute) => {
       if (groupRoute.id === route.id) return false;
       const groupDisplayName = normalizeRouteDisplayName(groupRoute.displayName);
-      if (!groupDisplayName || exactModelNames.has(groupDisplayName)) return false;
+      if (
+        !groupDisplayName
+        || exactModelNames.has(groupDisplayName.toLowerCase())
+        // A pattern alias that is identical to an unnamed exact route cannot
+        // replace that route in dispatch: findRoute() gives exact matches
+        // precedence. Keep the exact route visible so the UI reflects this.
+        || (
+          !isExplicitGroupRoute(groupRoute)
+          && groupDisplayName.toLowerCase() === exactModel.toLowerCase()
+        )
+      ) return false;
       if (isExplicitGroupRoute(groupRoute)) {
         return groupRoute.sourceRouteIds.includes(route.id);
       }
@@ -1416,7 +1408,7 @@ function buildVisibleEnabledRoutes(routes: RouteRow[]): RouteRow[] {
   });
 }
 
-function normalizeModelAlias(modelName: string): string {
+export function normalizeModelAlias(modelName: string): string {
   const normalized = (modelName || '').trim().toLowerCase();
   if (!normalized) return '';
   const slashIndex = normalized.lastIndexOf('/');
@@ -2025,6 +2017,12 @@ export class TokenRouter {
         username: row.account.username || `account-${row.account.id}`,
         siteName: row.site.name || 'unknown',
         tokenName: row.token?.name || 'default',
+        sourceModel: resolveActualModelForSelectedChannel(
+          requestedModel,
+          match.route,
+          mappedModel,
+          row.channel.sourceModel,
+        ),
         priority: row.channel.priority ?? 0,
         weight: row.channel.weight ?? 10,
         eligible,
@@ -2590,7 +2588,6 @@ export class TokenRouter {
       return;
     }
 
-    const affectedChannelIds = await loadCredentialScopedChannelIds(ch, account.id);
     const needsChannelReset = !!ch.cooldownUntil
       || !!ch.lastFailAt
       || (ch.consecutiveFailCount ?? 0) > 0
@@ -2602,53 +2599,13 @@ export class TokenRouter {
         lastFailAt: null,
         consecutiveFailCount: 0,
         cooldownLevel: 0,
-      }).where(inArray(schema.routeChannels.id, affectedChannelIds)).run();
-
-      for (const affectedChannelId of affectedChannelIds) {
-        patchCachedChannel(affectedChannelId, (channel) => {
-          channel.cooldownUntil = null;
-          channel.lastFailAt = null;
-          channel.consecutiveFailCount = 0;
-          channel.cooldownLevel = 0;
-        });
-      }
-    } else if (affectedChannelIds.length > 1) {
-      const scopedRows = await db.select({
-        id: schema.routeChannels.id,
-        cooldownUntil: schema.routeChannels.cooldownUntil,
-        lastFailAt: schema.routeChannels.lastFailAt,
-        consecutiveFailCount: schema.routeChannels.consecutiveFailCount,
-        cooldownLevel: schema.routeChannels.cooldownLevel,
-      })
-        .from(schema.routeChannels)
-        .where(inArray(schema.routeChannels.id, affectedChannelIds))
-        .all();
-      const siblingIdsToReset = scopedRows
-        .filter((candidate) => candidate.id !== channelId && (
-          !!candidate.cooldownUntil
-          || !!candidate.lastFailAt
-          || (candidate.consecutiveFailCount ?? 0) > 0
-          || (candidate.cooldownLevel ?? 0) > 0
-        ))
-        .map((candidate) => candidate.id);
-
-      if (siblingIdsToReset.length > 0) {
-        await db.update(schema.routeChannels).set({
-          cooldownUntil: null,
-          lastFailAt: null,
-          consecutiveFailCount: 0,
-          cooldownLevel: 0,
-        }).where(inArray(schema.routeChannels.id, siblingIdsToReset)).run();
-
-        for (const siblingId of siblingIdsToReset) {
-          patchCachedChannel(siblingId, (channel) => {
-            channel.cooldownUntil = null;
-            channel.lastFailAt = null;
-            channel.consecutiveFailCount = 0;
-            channel.cooldownLevel = 0;
-          });
-        }
-      }
+      }).where(eq(schema.routeChannels.id, channelId)).run();
+      patchCachedChannel(channelId, (channel) => {
+        channel.cooldownUntil = null;
+        channel.lastFailAt = null;
+        channel.consecutiveFailCount = 0;
+        channel.cooldownLevel = 0;
+      });
     }
 
     recordSiteRuntimeSuccess(account.siteId, latencyMs, modelName);
@@ -2770,7 +2727,10 @@ export class TokenRouter {
           cooldownUntil,
           updatedAt: nowIso,
         }).where(eq(schema.oauthRouteUnitMembers.id, memberRow.member.id)).run();
-        recordSiteRuntimeFailure(memberRow.account.siteId, normalizedContext, nowMs);
+        // 用量限流属于凭据/渠道级状态，不把单个成员的冷却扩散到整个站点。
+        if (!shortWindowLimitCooldownUntil) {
+          recordSiteRuntimeFailure(memberRow.account.siteId, normalizedContext, nowMs);
+        }
         invalidateRouteScopedCache(route.id);
         return;
       }
@@ -2779,9 +2739,8 @@ export class TokenRouter {
     const shortWindowLimitCooldownUntil = resolveShortWindowLimitCooldown(account, normalizedContext, nowMs);
     const failCount = shortWindowLimitCooldownUntil ? 0 : ((ch.failCount ?? 0) + 1);
     const routeStrategy = resolveRouteStrategy(route);
-    const affectedChannelIds = shortWindowLimitCooldownUntil
-      ? await loadCredentialScopedChannelIds(ch, account.id)
-      : [channelId];
+    // 每次失败只更新实际请求的通道，避免一个凭据的限流状态覆盖其他独立渠道。
+    const affectedChannelIds = [channelId];
     let cooldownUntil: string | null = null;
     let consecutiveFailCount = Math.max(0, ch.consecutiveFailCount ?? 0) + 1;
     let cooldownLevel = Math.max(0, ch.cooldownLevel ?? 0);
@@ -2823,7 +2782,9 @@ export class TokenRouter {
       });
     }
 
-    recordSiteRuntimeFailure(account.siteId, normalizedContext, nowMs);
+    if (!shortWindowLimitCooldownUntil) {
+      recordSiteRuntimeFailure(account.siteId, normalizedContext, nowMs);
+    }
   }
 
   /**

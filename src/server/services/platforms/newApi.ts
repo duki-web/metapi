@@ -1,8 +1,12 @@
-import { ApiTokenInfo, BasePlatformAdapter, CheckinResult, BalanceInfo, UserInfo, TokenVerifyResult, CreateApiTokenOptions, type SiteAnnouncement } from './base.js';
+import { ApiTokenInfo, BasePlatformAdapter, CheckinResult, BalanceInfo, UserInfo, TokenVerifyResult, CreateApiTokenOptions, type SiteAnnouncement, type LoginResult } from './base.js';
 import type { RequestInit as UndiciRequestInit } from 'undici';
-import { createContext, runInContext } from 'node:vm';
 import { withSiteProxyRequestInit } from '../siteProxy.js';
-import { fetchJsonWithShieldCookieRetry } from './newApiShield.js';
+import { fetchJsonWithShieldCookieRetry, solveNewApiAcwScV2 } from './newApiShield.js';
+import {
+  buildEndpointModelContextLengthScope,
+  extractContextLengthsFromPayload,
+  setModelContextLengths,
+} from '../modelContextLengthCache.js';
 
 export class NewApiAdapter extends BasePlatformAdapter {
   readonly platformName: string = 'new-api';
@@ -51,25 +55,21 @@ export class NewApiAdapter extends BasePlatformAdapter {
   }
 
   private authHeaders(accessToken: string, userId?: number): Record<string, string> {
-    return {
-      Authorization: `Bearer ${accessToken}`,
-      ...this.userIdHeaders(userId),
-    };
+    const headers: Record<string, string> = { Authorization: `Bearer ${accessToken}` };
+    this.appendUserIdCompatibilityHeaders(headers, userId);
+    return headers;
   }
 
-  private userIdHeaders(userId?: number | null): Record<string, string> {
-    const headers: Record<string, string> = {};
-    if (userId) {
-      const value = String(userId);
-      headers['New-API-User'] = value;
-      headers['Veloera-User'] = value;
-      headers['voapi-user'] = value;
-      headers['User-id'] = value;
-      headers['X-User-Id'] = value;
-      headers['Rix-Api-User'] = value;
-      headers['neo-api-user'] = value;
-    }
-    return headers;
+  private appendUserIdCompatibilityHeaders(headers: Record<string, string>, userId?: number | null): void {
+    if (!userId) return;
+    const value = String(userId);
+    headers['New-API-User'] = value;
+    headers['Veloera-User'] = value;
+    headers['voapi-user'] = value;
+    headers['User-id'] = value;
+    headers['X-User-Id'] = value;
+    headers['Rix-Api-User'] = value;
+    headers['neo-api-user'] = value;
   }
 
   private buildCookieCandidates(token: string): string[] {
@@ -77,16 +77,15 @@ export class NewApiAdapter extends BasePlatformAdapter {
     if (!trimmed) return [];
 
     const raw = trimmed.startsWith('Bearer ') ? trimmed.slice(7).trim() : trimmed;
-    const candidates: string[] = [];
-
-    if (raw.includes('=')) {
-      candidates.push(raw);
+    if (this.isCookieHeaderCredential(raw)) {
+      return [raw];
     }
 
-    candidates.push(`session=${raw}`);
-    candidates.push(`token=${raw}`);
+    return [`session=${raw}`, `token=${raw}`];
+  }
 
-    return Array.from(new Set(candidates));
+  private isCookieHeaderCredential(token: string): boolean {
+    return /(^|;\s*)(session|token|auth_token|access_token|jwt|jwt_token)=/i.test(token);
   }
 
   private decodeBase64Loose(value: string): string | null {
@@ -394,78 +393,9 @@ export class NewApiAdapter extends BasePlatformAdapter {
     };
   }
 
-  private parseChallengeArg1(html: string): string | null {
-    const match = html.match(/var\s+arg1\s*=\s*['"]([0-9a-fA-F]+)['"]/);
-    return match?.[1]?.toUpperCase() || null;
-  }
-
-  private parseChallengeMapping(html: string): number[] | null {
-    const match = html.match(/for\(var m=\[([^\]]+)\],p=L\(0x115\)/);
-    if (!match?.[1]) return null;
-
-    const values = match[1].split(',').map((raw) => {
-      const v = raw.trim().toLowerCase();
-      if (!v) return Number.NaN;
-      if (v.startsWith('0x')) return Number.parseInt(v.slice(2), 16);
-      return Number.parseInt(v, 10);
-    });
-    if (values.some((v) => Number.isNaN(v))) return null;
-    return values;
-  }
-
-  private parseChallengeXorSeed(html: string): string | null {
-    const fnStart = html.indexOf('function a0i()');
-    const bStart = html.indexOf('function b(');
-    const rotateStart = html.indexOf('(function(a,c){');
-    const rotateEnd = html.indexOf('),!(function', rotateStart);
-    if (fnStart < 0 || bStart < 0 || bStart <= fnStart || rotateStart < 0 || rotateEnd < 0) {
-      return null;
-    }
-
-    const helperCode = html.slice(fnStart, bStart);
-    const rotateCode = `${html.slice(rotateStart, rotateEnd + 1)})`;
-
-    try {
-      const sandbox: Record<string, unknown> = { decodeURIComponent };
-      createContext(sandbox);
-      runInContext(helperCode, sandbox, { timeout: 100 });
-      runInContext(rotateCode, sandbox, { timeout: 100 });
-      const decoder = sandbox['a0j'];
-      if (typeof decoder !== 'function') return null;
-      const seed = (decoder as (idx: number) => unknown)(0x115);
-      if (typeof seed !== 'string' || !/^[0-9a-f]+$/i.test(seed)) return null;
-      return seed;
-    } catch {
-      return null;
-    }
-  }
-
   private solveAcwScV2(html: string): string | null {
-    const arg1 = this.parseChallengeArg1(html);
-    const mapping = this.parseChallengeMapping(html);
-    const xorSeed = this.parseChallengeXorSeed(html);
-    if (!arg1 || !mapping || !xorSeed) return null;
-
-    const q: string[] = [];
-    for (let i = 0; i < arg1.length; i += 1) {
-      const ch = arg1[i];
-      for (let j = 0; j < mapping.length; j += 1) {
-        if (mapping[j] === i + 1) {
-          q[j] = ch;
-        }
-      }
-    }
-
-    const reordered = q.join('');
-    let out = '';
-    for (let i = 0; i < reordered.length && i < xorSeed.length; i += 2) {
-      const left = Number.parseInt(reordered.slice(i, i + 2), 16);
-      const right = Number.parseInt(xorSeed.slice(i, i + 2), 16);
-      if (Number.isNaN(left) || Number.isNaN(right)) return null;
-      out += (left ^ right).toString(16).padStart(2, '0');
-    }
-
-    return out || null;
+    // Shared pure parser: never executes upstream-supplied script.
+    return solveNewApiAcwScV2(html);
   }
 
   private upsertCookie(cookieHeader: string, name: string, value: string): string {
@@ -680,6 +610,28 @@ export class NewApiAdapter extends BasePlatformAdapter {
     );
   }
 
+  private shouldPreferCheckinFailureMessage(
+    currentMessage: string | undefined,
+    nextMessage: string | null | undefined,
+  ): boolean {
+    const next = typeof nextMessage === 'string' ? nextMessage.trim() : '';
+    if (!next) return false;
+    if (!currentMessage) return true;
+
+    if (this.isHtmlJsonParseErrorMessage(currentMessage) && !this.isHtmlJsonParseErrorMessage(next)) {
+      return true;
+    }
+
+    const currentLooksLikeMissingEndpoint =
+      this.isMissingCheckinEndpointMessage(currentMessage)
+      || /^HTTP\s+404:/i.test(currentMessage);
+    if (currentLooksLikeMissingEndpoint && this.isCookieSessionFailureMessage(next)) {
+      return true;
+    }
+
+    return false;
+  }
+
   private async detectCookieSessionFailureMessage(
     baseUrl: string,
     accessToken: string,
@@ -777,7 +729,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
     for (const cookie of this.buildCookieCandidates(token)) {
       try {
         const headers: Record<string, string> = { Cookie: cookie };
-        Object.assign(headers, this.userIdHeaders(platformUserId));
+        this.appendUserIdCompatibilityHeaders(headers, platformUserId);
         const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/self`, { headers });
         if (res?.success && res?.data) return res;
         if (typeof res?.message === 'string' && res.message.trim()) {
@@ -793,9 +745,9 @@ export class NewApiAdapter extends BasePlatformAdapter {
     for (const cookie of this.buildCookieCandidates(token)) {
       for (const id of candidates) {
         try {
-          const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/self`, {
-            headers: { Cookie: cookie, ...this.userIdHeaders(id) },
-          });
+          const headers: Record<string, string> = { Cookie: cookie };
+          this.appendUserIdCompatibilityHeaders(headers, id);
+          const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/self`, { headers });
           if (res?.success && res?.data) return id;
         } catch {}
       }
@@ -820,7 +772,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
     for (const cookie of this.buildCookieCandidates(token)) {
       try {
         const headers: Record<string, string> = { Cookie: cookie };
-        Object.assign(headers, this.userIdHeaders(userId));
+        this.appendUserIdCompatibilityHeaders(headers, userId);
         const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/token/?p=0&size=100`, { headers });
         const normalized = this.normalizeTokenItems(this.parseTokenItems(res));
         if (normalized.length > 0) return normalized;
@@ -833,7 +785,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
     for (const cookie of this.buildCookieCandidates(token)) {
       try {
         const headers: Record<string, string> = { Cookie: cookie };
-        Object.assign(headers, this.userIdHeaders(userId));
+        this.appendUserIdCompatibilityHeaders(headers, userId);
         const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/models`, { headers });
         if (Array.isArray(res?.data) && res.data.length > 0) return res.data.filter(Boolean);
         if (res?.data && typeof res.data === 'object') {
@@ -845,12 +797,18 @@ export class NewApiAdapter extends BasePlatformAdapter {
     return [];
   }
 
-  private extractOpenAiModels(payload: any): string[] {
+  private extractOpenAiModels(payload: any, sourceScope: string): string[] {
     if (!Array.isArray(payload?.data)) return [];
+    const contextLengths = extractContextLengthsFromPayload(payload);
+    setModelContextLengths(contextLengths, sourceScope);
     return payload.data.map((m: any) => m?.id).filter(Boolean);
   }
 
-  private async getOpenAiModelsViaShieldCookie(baseUrl: string, token: string): Promise<string[]> {
+  private async getOpenAiModelsViaShieldCookie(
+    baseUrl: string,
+    token: string,
+    sourceScope: string,
+  ): Promise<string[]> {
     for (const cookie of this.buildCookieCandidates(token)) {
       try {
         const { data } = await fetchJsonWithShieldCookieRetry<any>(`${baseUrl}/v1/models`, {
@@ -859,17 +817,18 @@ export class NewApiAdapter extends BasePlatformAdapter {
             Cookie: cookie,
           },
         });
-        const models = this.extractOpenAiModels(data);
+        const models = this.extractOpenAiModels(data, sourceScope);
         if (models.length > 0) return models;
       } catch {}
     }
     return [];
   }
 
-  private async getOpenAiModels(baseUrl: string, token: string): Promise<string[]> {
+  private async getOpenAiModels(baseUrl: string, token: string, contextSourceScope?: string): Promise<string[]> {
+    const sourceScope = contextSourceScope || buildEndpointModelContextLengthScope(baseUrl);
     const shouldTryShieldCookie = this.platformName === 'anyrouter' || token.includes('=');
     if (shouldTryShieldCookie) {
-      const shieldModels = await this.getOpenAiModelsViaShieldCookie(baseUrl, token);
+      const shieldModels = await this.getOpenAiModelsViaShieldCookie(baseUrl, token, sourceScope);
       if (shieldModels.length > 0) return shieldModels;
     }
 
@@ -877,7 +836,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
       const res = await this.fetchJson<any>(`${baseUrl}/v1/models`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      return this.extractOpenAiModels(res);
+      return this.extractOpenAiModels(res, sourceScope);
     } catch {
       return [];
     }
@@ -946,7 +905,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
     baseUrl: string,
     username: string,
     password: string,
-  ): Promise<{ success: boolean; accessToken?: string; username?: string; message?: string }> {
+  ): Promise<LoginResult> {
     try {
       const { data: res, cookieHeader } = await this.fetchJsonRawWithCookie<any>(`${baseUrl}/api/user/login`, {
         method: 'POST',
@@ -960,11 +919,13 @@ export class NewApiAdapter extends BasePlatformAdapter {
       }
 
       const accessToken = this.extractLoginAccessToken(res);
+      const platformUserId = this.extractLoginUserId(res);
       if (res?.success && accessToken) {
         return {
           success: true,
           accessToken,
           username,
+          platformUserId,
         };
       }
       if (res?.success && this.hasUsableSessionCookie(cookieHeader)) {
@@ -972,6 +933,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
           success: true,
           accessToken: cookieHeader,
           username,
+          platformUserId,
         };
       }
 
@@ -1084,22 +1046,32 @@ export class NewApiAdapter extends BasePlatformAdapter {
   async checkin(baseUrl: string, accessToken: string, platformUserId?: number): Promise<CheckinResult> {
     const resolvedUserId = platformUserId || await this.discoverUserId(baseUrl, accessToken);
     let firstFailureMessage: string | undefined;
-
-    try {
-      const headers = this.authHeaders(accessToken, resolvedUserId || undefined);
-
-      const res = await this.fetchJson<any>(`${baseUrl}/api/user/checkin`, {
-        method: 'POST',
-        headers,
-      });
-      if (res?.success) {
-        return { success: true, message: res.message || 'checkin success', reward: res.data?.reward?.toString() };
+    const rememberFailure = (message?: string | null) => {
+      if (this.shouldPreferCheckinFailureMessage(firstFailureMessage, message)) {
+        firstFailureMessage = String(message).trim();
       }
-      const directMessage = this.extractResponseMessage(res);
-      if (directMessage) firstFailureMessage = directMessage;
-    } catch (err) {
-      const parsed = this.formatRequestErrorMessage(err);
-      if (parsed) firstFailureMessage = parsed;
+    };
+
+    const rawCredential = (accessToken || '').trim().startsWith('Bearer ')
+      ? (accessToken || '').trim().slice(7).trim()
+      : (accessToken || '').trim();
+    if (!this.isCookieHeaderCredential(rawCredential)) {
+      try {
+        const headers = this.authHeaders(accessToken, resolvedUserId || undefined);
+
+        const res = await this.fetchJson<any>(`${baseUrl}/api/user/checkin`, {
+          method: 'POST',
+          headers,
+        });
+        if (res?.success) {
+          return { success: true, message: res.message || 'checkin success', reward: res.data?.reward?.toString() };
+        }
+        const directMessage = this.extractResponseMessage(res);
+        rememberFailure(directMessage);
+      } catch (err) {
+        const parsed = this.formatRequestErrorMessage(err);
+        rememberFailure(parsed);
+      }
     }
 
     if (firstFailureMessage && !this.shouldFallbackToCookieCheckin(firstFailureMessage)) {
@@ -1109,13 +1081,15 @@ export class NewApiAdapter extends BasePlatformAdapter {
     const tryCookieCheckin = async (cookieUserId?: number | null): Promise<CheckinResult | null> => {
       for (const cookie of this.buildCookieCandidates(accessToken)) {
         try {
+          const headers: Record<string, string> = {
+            Cookie: cookie,
+            'X-Requested-With': 'XMLHttpRequest',
+          };
+          this.appendUserIdCompatibilityHeaders(headers, cookieUserId);
           const signInRes = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/sign_in`, {
             method: 'POST',
             body: '{}',
-            headers: {
-              Cookie: cookie,
-              'X-Requested-With': 'XMLHttpRequest',
-            },
+            headers,
           });
           if (signInRes?.success) {
             return {
@@ -1125,15 +1099,15 @@ export class NewApiAdapter extends BasePlatformAdapter {
             };
           }
           const signInMessage = this.extractResponseMessage(signInRes);
-          if (!firstFailureMessage && signInMessage) firstFailureMessage = signInMessage;
+          rememberFailure(signInMessage);
         } catch (err) {
           const parsed = this.formatRequestErrorMessage(err);
-          if (!firstFailureMessage && parsed) firstFailureMessage = parsed;
+          rememberFailure(parsed);
         }
 
         try {
           const headers: Record<string, string> = { Cookie: cookie };
-          Object.assign(headers, this.userIdHeaders(cookieUserId));
+          this.appendUserIdCompatibilityHeaders(headers, cookieUserId);
           const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/checkin`, {
             method: 'POST',
             headers,
@@ -1142,10 +1116,10 @@ export class NewApiAdapter extends BasePlatformAdapter {
             return { success: true, message: res.message || 'checkin success', reward: res.data?.reward?.toString() };
           }
           const cookieMessage = this.extractResponseMessage(res);
-          if (cookieMessage) firstFailureMessage = cookieMessage;
+          rememberFailure(cookieMessage);
         } catch (err) {
           const parsed = this.formatRequestErrorMessage(err);
-          if (parsed) firstFailureMessage = parsed;
+          rememberFailure(parsed);
         }
       }
 
@@ -1223,8 +1197,13 @@ export class NewApiAdapter extends BasePlatformAdapter {
     throw new Error(failureMessage || 'failed to fetch balance');
   }
 
-  async getModels(baseUrl: string, token: string, platformUserId?: number): Promise<string[]> {
-    const openAiModels = await this.getOpenAiModels(baseUrl, token);
+  async getModels(
+    baseUrl: string,
+    token: string,
+    platformUserId?: number,
+    contextSourceScope?: string,
+  ): Promise<string[]> {
+    const openAiModels = await this.getOpenAiModels(baseUrl, token, contextSourceScope);
     if (openAiModels.length > 0) return openAiModels;
 
     const userId = platformUserId || await this.discoverUserId(baseUrl, token);
@@ -1292,7 +1271,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
     for (const cookie of this.buildCookieCandidates(accessToken)) {
       try {
         const headers: Record<string, string> = { Cookie: cookie };
-        Object.assign(headers, this.userIdHeaders(cookieUserId));
+        this.appendUserIdCompatibilityHeaders(headers, cookieUserId);
         const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/token/`, {
           method: 'POST',
           headers,
@@ -1335,7 +1314,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
     const cookieUserId = resolvedUserId || await this.probeUserIdByCookie(baseUrl, accessToken);
     for (const cookie of this.buildCookieCandidates(accessToken)) {
       const headers: Record<string, string> = { Cookie: cookie };
-      Object.assign(headers, this.userIdHeaders(cookieUserId));
+      this.appendUserIdCompatibilityHeaders(headers, cookieUserId);
 
       try {
         const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/self/groups`, { headers });
@@ -1403,7 +1382,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
     const cookieUserId = resolvedUserId || await this.probeUserIdByCookie(baseUrl, accessToken);
     for (const cookie of this.buildCookieCandidates(accessToken)) {
       const headers: Record<string, string> = { Cookie: cookie };
-      Object.assign(headers, this.userIdHeaders(cookieUserId));
+      this.appendUserIdCompatibilityHeaders(headers, cookieUserId);
 
       try {
         if (!tokenId) {

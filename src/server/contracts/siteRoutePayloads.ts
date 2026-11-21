@@ -11,11 +11,13 @@ const siteCreatePayloadSchema = z.object({
   proxyUrl: unknownField,
   useSystemProxy: unknownField,
   customHeaders: unknownField,
+  customHeadersOverrideRequestHeaders: unknownField,
   externalCheckinUrl: unknownField,
   status: unknownField,
   isPinned: unknownField,
   sortOrder: unknownField,
   globalWeight: unknownField,
+  maxConcurrency: unknownField,
 }).passthrough();
 
 const siteUpdatePayloadSchema = z.object({
@@ -25,11 +27,13 @@ const siteUpdatePayloadSchema = z.object({
   proxyUrl: unknownField,
   useSystemProxy: unknownField,
   customHeaders: unknownField,
+  customHeadersOverrideRequestHeaders: unknownField,
   externalCheckinUrl: unknownField,
   status: unknownField,
   isPinned: unknownField,
   sortOrder: unknownField,
   globalWeight: unknownField,
+  maxConcurrency: unknownField,
 }).passthrough();
 
 const siteBatchPayloadSchema = z.object({

@@ -95,7 +95,8 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
     serverChanEnabled: parseBoolean(env.SERVERCHAN_ENABLED, true),
     serverChanKey: env.SERVERCHAN_KEY || '',
     telegramEnabled: parseBoolean(env.TELEGRAM_ENABLED, false),
-    telegramApiBaseUrl: 'https://api.telegram.org',
+    telegramApiBaseUrl:
+      (env.TELEGRAM_API_BASE_URL || '').trim().replace(/\/+$/, '') || 'https://api.telegram.org',
     telegramBotToken: env.TELEGRAM_BOT_TOKEN || '',
     telegramChatId: env.TELEGRAM_CHAT_ID || '',
     telegramUseSystemProxy: parseBoolean(env.TELEGRAM_USE_SYSTEM_PROXY, false),
@@ -110,6 +111,8 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
     smtpTo: env.SMTP_TO || '',
     notifyCooldownSec: Math.max(0, Math.trunc(parseNumber(env.NOTIFY_COOLDOWN_SEC, 300))),
     adminIpAllowlist: parseCsvList(env.ADMIN_IP_ALLOWLIST),
+    // Socket peers (IPs/CIDRs) allowed to supply X-Forwarded-For. Empty = trust no proxy.
+    trustedProxies: parseCsvList(env.TRUSTED_PROXIES),
     port: Math.trunc(parseNumber(env.PORT, 4000)),
     listenHost: parseListenHost(env),
     dataDir,
@@ -178,7 +181,8 @@ export function buildFastifyOptions(
 ): FastifyServerOptions {
   return {
     logger: true,
-    trustProxy: true,
+    // Only honor forwarded headers from explicitly configured proxies.
+    trustProxy: appConfig.trustedProxies.length > 0 ? appConfig.trustedProxies : false,
     bodyLimit: appConfig.requestBodyLimit,
   };
 }
